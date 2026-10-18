@@ -722,47 +722,142 @@ class PioreactorTools:
                 result["pearson_r"] = round(float(np.corrcoef(y0, y1_on_x0)[0, 1]), 3)
         return result
 
-    def plot_plan(self, plan: ExperimentPlan) -> dict[str, Any]:
-        """PNG of the plan against what happened: one panel per setpoint (temperature, stirring) with
-        the target as a dashed line and off-target stretches shaded. The /plan page draws the same."""
-        from matplotlib.figure import Figure
+    # Colours for plan charts: dark, high-contrast, readable on a projector and in Slack's dark mode.
+    PLAN_STYLE = {"bg": "#0b1220", "panel": "#111a2e", "grid": "#22304d", "text": "#e6edf7", "muted": "#8a9bb8",
+                  "target": "#2dd4bf", "measured": {"temperature": "#f59e0b", "stirring": "#60a5fa"},
+                  "off": "#ef4444", "proposed": "#e879f9"}
 
+    def _plan_series(self, plan: ExperimentPlan) -> tuple[float, dict[str, tuple[list[float], list[float]]]]:
+        """Plan start (epoch s) and, per setpoint metric, (minutes since start, values)."""
         start = parse_timestamp(plan.started_at).timestamp() if plan.started_at else time.time()
         elapsed_min = max(1.0, min((time.time() - start) / 60, plan.duration_h * 60))
-        metrics = [m for m in ("temperature", "stirring") if plan.target(m) is not None]
-        if not metrics:
-            raise ToolError("The plan sets no temperature or stirring speed to compare against.")
-
-        fig = Figure(figsize=(10, 2.4 * len(metrics) + 0.6), dpi=120)
-        axes = fig.subplots(len(metrics), 1, sharex=True, squeeze=False)[:, 0]
-        end_min = plan.duration_h * 60
-        off_target_min: dict[str, float] = {}
-        for ax, metric in zip(axes, metrics):
+        out = {}
+        for metric in ("temperature", "stirring"):
+            if plan.target(metric) is None:
+                continue
             s, _ = self.get_series(metric, plan.unit, elapsed_min + 1)
-            t_min = [(t.timestamp() - start) / 60 for t in s.timestamps]
+            out[metric] = ([(t.timestamp() - start) / 60 for t in s.timestamps], list(s.values))
+        if not out:
+            raise ToolError("The plan sets no temperature or stirring speed to compare against.")
+        return start, out
+
+    def _draw_plan(self, fig: Any, plan: ExperimentPlan, series: dict[str, tuple[list[float], list[float]]],
+                   upto_min: float, proposed: dict[str, float] | None = None) -> dict[str, float]:
+        """Draw the plan chart with readings up to `upto_min`. Returns minutes off target per metric.
+        `proposed` (metric -> value) adds a second dashed line from now to the end: a change not yet applied."""
+        from matplotlib.patches import Rectangle
+
+        st = self.PLAN_STYLE
+        fig.clear()
+        fig.patch.set_facecolor(st["bg"])
+        end_min = plan.duration_h * 60
+        metrics = list(series)
+        axes = fig.subplots(len(metrics), 1, sharex=True, squeeze=False)[:, 0]
+        fig.subplots_adjust(left=0.08, right=0.97, top=0.80, bottom=0.12, hspace=0.18)
+        off_target_min: dict[str, float] = {}
+        headline = []
+        for ax, metric in zip(axes, metrics):
+            t_all, v_all = series[metric]
+            pts = [(t, v) for t, v in zip(t_all, v_all) if t <= upto_min]
+            ts, vs = [p[0] for p in pts], [p[1] for p in pts]
             target = plan.target(metric)
-            off = 0.0
-            for i, (t, v) in enumerate(zip(t_min, s.values)):
-                if plan.off_target(metric, t * 60, v):
-                    nxt = t_min[i + 1] if i + 1 < len(t_min) else t + 10 / 60
-                    ax.axvspan(t, nxt, color="#fed7aa", lw=0)
+            color = st["measured"][metric]
+            ax.set_facecolor(st["panel"])
+            for side in ax.spines.values():
+                side.set_visible(False)
+            ax.tick_params(colors=st["muted"], labelsize=9)
+            ax.grid(color=st["grid"], lw=0.8)
+            # off-target stretches, each labelled with its length
+            off, run_start = 0.0, None
+            for i, (t, v) in enumerate(pts):
+                nxt = ts[i + 1] if i + 1 < len(ts) else t + 10 / 60
+                bad = plan.off_target(metric, t * 60, v)
+                if bad:
+                    ax.axvspan(t, nxt, color=st["off"], alpha=0.22, lw=0)
                     off += nxt - t
+                    run_start = t if run_start is None else run_start
+                if run_start is not None and (not bad or i + 1 == len(pts)):
+                    ax.annotate(f"off target\n{(nxt if bad else t) - run_start:.1f} min",
+                                xy=(run_start, plan.target(metric, run_start * 60)),
+                                xytext=(4, -26), textcoords="offset points", color=st["off"], fontsize=8, weight="bold")
+                    run_start = None
             off_target_min[metric] = round(off, 1)
-            ax.hlines(target, 0, end_min, colors="#0f766e", linestyles="dashed", lw=2, label="target (plan)")
-            if s.values:
-                ax.plot(t_min, s.values, color="#1c2421", lw=1.5, label="measured")
-            ax.axvline(min((time.time() - start) / 60, end_min), color="#6b7570", ls=":", lw=1)
-            ax.set_ylabel(METRIC_LABELS[metric])
-            ax.grid(alpha=0.3)
-        axes[0].legend(loc="lower right", fontsize=8)
-        axes[0].set_title(f"LARR-E · {plan.name} on {plan.unit}: plan vs measured")
-        axes[-1].set_xlabel("minutes since the plan started (dashed = target, shaded = off target)")
+            # target: a glowing dashed line across the whole plan, stepping at each approved change
+            steps = plan.target_steps(metric)
+            sx, sy = [t for t, _ in steps] + [end_min], [v for _, v in steps] + [steps[-1][1]]
+            for lw, alpha in ((9, 0.06), (5, 0.12)):
+                ax.plot(sx, sy, color=st["target"], lw=lw, alpha=alpha, drawstyle="steps-post")
+            ax.plot(sx, sy, color=st["target"], ls=(0, (6, 4)), lw=2, drawstyle="steps-post", gid="target")
+            ax.text(end_min, target, f" target {target:g}", color=st["target"], fontsize=8, va="bottom", ha="right")
+            if proposed and proposed.get(metric) is not None:
+                new, now_min = proposed[metric], min(max(upto_min, 0.0), end_min)
+                ax.plot([now_min, end_min], [new, new], color=st["proposed"], ls="--", lw=2.2, gid="proposed")
+                ax.text(end_min, new, f" proposed {new:g}", color=st["proposed"], fontsize=8, weight="bold",
+                        va="bottom" if new >= target else "top", ha="right")
+            if vs:
+                lo = min(min(vs), target)
+                ax.fill_between(ts, vs, lo - abs(lo) * 0.05, color=color, alpha=0.18, lw=0)
+                for lw, alpha in ((7, 0.10), (4, 0.18)):
+                    ax.plot(ts, vs, color=color, lw=lw, alpha=alpha, solid_capstyle="round")
+                ax.plot(ts, vs, color=color, lw=2)
+                ax.plot(ts[-1:], vs[-1:], "o", color=color, ms=7, mec=st["bg"], mew=1.5)
+                unit = "°C" if metric == "temperature" else "rpm"
+                headline.append((f"{vs[-1]:.1f} {unit}" if metric == "temperature" else f"{vs[-1]:.0f} {unit}", color))
+            ax.axvline(min(upto_min, end_min), color=st["muted"], ls=":", lw=1)
+            ax.set_ylabel(METRIC_LABELS[metric], color=st["muted"], fontsize=9)
         axes[-1].set_xlim(-0.02 * end_min, end_min * 1.02)
-        fig.tight_layout()
-        out = self.cfg.output.plots_dir / f"{plan.unit}_plan_{int(time.time())}.png"
+        axes[-1].set_xlabel("minutes since the plan started", color=st["muted"], fontsize=9)
+        # headline: plan name, big live numbers, progress bar
+        fig.text(0.08, 0.93, f"{plan.name} · {plan.unit}", color=st["text"], fontsize=15, weight="bold")
+        x = 0.08
+        for label, color in headline:
+            fig.text(x, 0.855, label, color=color, fontsize=13, weight="bold")
+            x += 0.16
+        done = max(0.0, min(1.0, upto_min / end_min)) if end_min else 0.0
+        fig.text(0.97, 0.93, f"{min(upto_min, end_min):.0f} of {end_min:.0f} min", color=st["muted"], fontsize=10, ha="right")
+        fig.patches.extend([
+            Rectangle((0.60, 0.865), 0.37, 0.018, transform=fig.transFigure, color=st["grid"]),
+            Rectangle((0.60, 0.865), 0.37 * done, 0.018, transform=fig.transFigure, color=st["target"]),
+        ])
+        return off_target_min
+
+    def plot_plan(self, plan: ExperimentPlan, proposed: dict[str, float] | None = None) -> dict[str, Any]:
+        """PNG of the plan against what happened: one panel per setpoint (temperature, stirring) with
+        the target as a dashed line and off-target stretches shaded. The /plan page draws the same.
+        `proposed` draws a setpoint change that is waiting for approval as a second dashed line."""
+        from matplotlib.figure import Figure
+
+        start, series = self._plan_series(plan)
+        fig = Figure(figsize=(10, 2.3 * len(series) + 1.4), dpi=120)
+        off_target_min = self._draw_plan(fig, plan, series, (time.time() - start) / 60, proposed)
+        out = self.cfg.output.plots_dir / f"{plan.unit}_plan_{time.time_ns()}.png"
         out.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out)
+        fig.savefig(out, facecolor=fig.get_facecolor())
         return {"unit": plan.unit, "png_path": str(out), "off_target_min": off_target_min}
+
+    def replay_plan_gif(self, plan: ExperimentPlan, frames: int = 36, seconds: float = 5.0) -> dict[str, Any]:
+        """Animated GIF of the whole run: the measured lines draw themselves along the target line,
+        then the last frame holds. For the end-of-experiment message."""
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from PIL import Image
+
+        start, series = self._plan_series(plan)
+        upto_end = min((time.time() - start) / 60, plan.duration_h * 60)
+        fig = Figure(figsize=(10, 2.3 * len(series) + 1.4), dpi=80)
+        canvas = FigureCanvasAgg(fig)
+        images, off_target_min = [], {}
+        for i in range(frames):
+            off_target_min = self._draw_plan(fig, plan, series, upto_end * (i + 1) / frames)
+            canvas.draw()
+            images.append(Image.frombuffer("RGBA", canvas.get_width_height(), canvas.buffer_rgba()).convert(
+                "P", palette=Image.Palette.ADAPTIVE, colors=128))
+        out = self.cfg.output.plots_dir / f"{plan.unit}_replay_{int(time.time())}.gif"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        step_ms = int(seconds * 1000 / frames)
+        images[0].save(out, save_all=True, append_images=images[1:], loop=0,
+                       duration=[step_ms] * (frames - 1) + [3000], optimize=True)
+        return {"unit": plan.unit, "gif_path": str(out), "off_target_min": off_target_min}
 
     # ------------------------------------------------------------------ live state
 

@@ -74,6 +74,11 @@ class ExperimentPlan:
     slack_channel: str | None = None
     slack_thread_ts: str | None = None
     final_posted: bool = False
+    # The one live Slack card for this plan, edited in place on each update.
+    slack_card_ts: str | None = None
+    # Setpoint changes approved while the plan runs: [{"at", "metric", "value", "by"}], oldest first.
+    # temperature_c / rpm stay what was asked for at the start (and what the profile started with).
+    setpoints: list[dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------ validation
 
@@ -181,8 +186,8 @@ class ExperimentPlan:
         return {
             "plan_status": self.status,
             "jobs_should_be_running": sorted(self.jobs()) if running else [],
-            "target_temperature_c": self.temperature_c if running else None,
-            "target_rpm": self.rpm if running else None,
+            "target_temperature_c": self.target("temperature") if running else None,
+            "target_rpm": self.target("stirring") if running else None,
             "elapsed_h": round(self.elapsed_h(now) or 0.0, 2),
             "ends_at": _iso(self.ends_at()) if self.ends_at() else None,
         }
@@ -194,17 +199,44 @@ class ExperimentPlan:
     WARM_UP_S = 600
     SPIN_UP_S = 30
 
-    def target(self, metric: str) -> float | None:
-        return {"temperature": self.temperature_c, "stirring": self.rpm}.get(metric)
+    def set_target(self, metric: str, value: float, by: str = "", now: datetime | None = None) -> None:
+        """Record an approved setpoint change. The caller has already sent it to the reactor."""
+        if self.target(metric) is None:
+            raise ValueError(f"The plan doesn't control {metric}.")
+        self.setpoints.append({"at": _iso(now or _now()), "metric": metric, "value": float(value), "by": by})
+
+    def target_steps(self, metric: str) -> list[tuple[float, float]]:
+        """The setpoint as a step line: (minutes since the plan started, value) at the start and each change."""
+        initial = {"temperature": self.temperature_c, "stirring": self.rpm}.get(metric)
+        if initial is None:
+            return []
+        start = _parse(self.started_at) if self.started_at else None
+        steps = [(0.0, float(initial))]
+        for sp in self.setpoints:
+            if sp["metric"] == metric:
+                at = (_parse(sp["at"]) - start).total_seconds() / 60 if start else 0.0
+                steps.append((round(at, 4), float(sp["value"])))
+        return steps
+
+    def target(self, metric: str, seconds_in: float | None = None) -> float | None:
+        """The setpoint in force `seconds_in` after the start, or the current one."""
+        steps = self.target_steps(metric)
+        if not steps:
+            return None
+        if seconds_in is None:
+            return steps[-1][1]
+        return [v for t, v in steps if t * 60 <= seconds_in or t == 0][-1]
 
     def off_target(self, metric: str, seconds_in: float, value: float) -> bool:
-        """Whether a reading taken `seconds_in` after the plan started is off the plan's setpoint."""
-        target = self.target(metric)
+        """Whether a reading taken `seconds_in` after the plan started is off the setpoint in force then.
+        The warm-up / spin-up allowance restarts at each setpoint change."""
+        target = self.target(metric, seconds_in)
         if target is None or not 0 <= seconds_in <= self.duration_h * 3600:
             return False
+        since = seconds_in - max(t * 60 for t, _ in self.target_steps(metric) if t * 60 <= seconds_in or t == 0)
         if metric == "temperature":
-            return seconds_in > self.WARM_UP_S and abs(value - target) > self.TEMP_TOLERANCE_C
-        return seconds_in > self.SPIN_UP_S and abs(value - target) > target * self.RPM_TOLERANCE_FRAC
+            return since > self.WARM_UP_S and abs(value - target) > self.TEMP_TOLERANCE_C
+        return since > self.SPIN_UP_S and abs(value - target) > target * self.RPM_TOLERANCE_FRAC
 
     def public(self) -> dict[str, Any]:
         d = asdict(self)

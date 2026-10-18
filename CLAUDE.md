@@ -163,6 +163,9 @@ directly leaves `amqtt` off PATH, and the end-to-end twin tests then skip silent
      itself but missed the readings in between, including one stall.
    - **`pioreactor.local` (mDNS) lookups are flaky**, and inside Claude Code's sandbox ssh and MQTT
      can't resolve it at all (curl works through the proxy). Expect a few seconds' delay on connect.
+     Tailscale (`docs/tailscale.md`): `pio01` is on the tailnet (shared in and signed for Tailnet
+     Lock) at `pio01.tail16b47e.ts.net` / `100.92.181.57`. SSH, REST, MQTT and `larr-e status` were
+     checked over it on 17 Oct. Not yet done: `.env` switched over, and the twin test stack on a server.
    - The `./.env.*` read deny also hides `.env.example` from Claude Code.
 
 ## Running it
@@ -174,5 +177,7 @@ uv run larr-e listen --no-triage    # terminal 1: telemetry, alerts, recorder
 uv run larr-e status                # live table, no LLM
 uv run larr-e exec "…"              # asks before touching hardware
 uv run larr-e twin --units twin1,twin2 --experiment larre-twin --mqtt-host pioreactor.local --port 8790
+#   the twin's thermostat runs at real speed (a reading every 225 s, ~25 min to 37 °C); add
+#   --temp-speed 10 for a stage demo. Gaps from a real Pioreactor: docs/twin-fidelity.md
 uv run --group dev pytest           # ~55 s; the twin test needs mosquitto or amqtt (dev group)
 ```

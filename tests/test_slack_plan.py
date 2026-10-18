@@ -61,29 +61,74 @@ def test_plan_chart_draws_targets_and_counts_time_off_target(tmp_path):
     assert 1.7 <= out["off_target_min"]["stirring"] <= 2.3
 
 
-def bot_with(cfg):
+class CardSlack(FakeSlack):
+    """Like Slack: an upload returns the file, so a message can show it in an image block."""
+
+    def __init__(self, reject_images: int = 0):
+        super().__init__()
+        self.reject_images = reject_images  # how many image-block posts to refuse, like a file still processing
+
+    def files_upload_v2(self, **kw):
+        super().files_upload_v2(**kw)
+        return {"file": {"id": f"F{len(self.files)}"}}
+
+    def chat_postMessage(self, **kw):
+        if self.reject_images and any(b["type"] == "image" for b in kw.get("blocks") or []):
+            self.reject_images -= 1
+            from slack_sdk.errors import SlackApiError
+            raise SlackApiError("invalid_blocks", {"ok": False, "error": "invalid_blocks"})
+        return super().chat_postMessage(**kw)
+
+
+def bot_with(cfg, client=None):
     pytest.importorskip("slack_bolt")
     from slack_bot import LarreBot
 
     class App:
-        client = FakeSlack()
-
         def event(self, *_):
             return lambda f: f
 
         command = action = event
 
-    return LarreBot(cfg, app=App(), bot_user_id="UBOT")
+    App.client = client or CardSlack()
+    bot = LarreBot(cfg, app=App(), bot_user_id="UBOT")
+    bot.file_ready_delay_s = 0
+    return bot
 
 
-def test_progress_update_posts_the_plan_chart_first(tmp_path):
+def test_progress_card_shows_the_plan_chart_inline(tmp_path):
+    # Changed 17 Oct at the team's request: the chart now sits inside the progress card, not as a separate file.
     start = time.time() - 20 * MIN
     write_history(tmp_path, start)
     bot = bot_with(make_settings(tmp_path))
     bot.post_progress(running_plan(start, slack_channel="C1", slack_thread_ts="1.1"))
-    first = bot.client.files[0]
-    assert "plan" in first["title"].lower()
-    assert "stirring off target 2" in first["initial_comment"]  # 2.0 min, roughly
+    upload = bot.client.files[0]
+    assert "plan" in upload["title"].lower() and "channel" not in upload  # uploaded privately, shown via the card
+    card = bot.client.posts[0]
+    kinds = [b["type"] for b in card["blocks"]]
+    assert kinds[:2] == ["section", "image"]
+    assert card["blocks"][1]["slack_file"] == {"id": "F1"}
+    assert "stirring off target 2" in card["blocks"][0]["text"]["text"]
+
+
+def test_card_falls_back_to_a_thread_file_if_slack_refuses_the_image(tmp_path):
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    bot = bot_with(make_settings(tmp_path), CardSlack(reject_images=2))  # first try and the retry
+    bot.post_progress(running_plan(start, slack_channel="C1", slack_thread_ts="1.1"))
+    card = bot.client.posts[0]
+    assert not any(b["type"] == "image" for b in card.get("blocks") or [])
+    assert "stirring off target 2" in card["text"]
+    shared = [f for f in bot.client.files if f.get("channel") == "C1"]
+    assert shared and "plan" in shared[0]["title"].lower()
+
+
+def test_card_retries_once_while_the_upload_is_processing(tmp_path):
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    bot = bot_with(make_settings(tmp_path), CardSlack(reject_images=1))
+    bot.post_progress(running_plan(start, slack_channel="C1", slack_thread_ts="1.1"))
+    assert any(b["type"] == "image" for b in bot.client.posts[0]["blocks"])
 
 
 def with_public_url(tmp_path, url="http://10.0.0.5:8787", token="tok"):
@@ -101,6 +146,8 @@ def test_progress_update_has_an_adjust_button_when_the_page_is_reachable(tmp_pat
     bot = bot_with(with_public_url(tmp_path))
     bot.post_progress(running_plan(start, slack_channel="C1", slack_thread_ts="1.1"))
     (adjust,) = [b for b in buttons(bot.client.posts[0]) if b.get("url")]
+    kinds = [b["type"] for b in bot.client.posts[0]["blocks"]]
+    assert kinds.index("actions") > kinds.index("image")  # the button sits under the chart
     assert adjust["url"] == "http://10.0.0.5:8787/plan?k=tok&unit=pio1"
     assert "Adjust" in adjust["text"]["text"]
     assert bot.client.posts[0]["text"]  # plain-text fallback for notifications
@@ -129,3 +176,31 @@ def test_plan_approval_card_has_an_adjust_button(tmp_path):
     # other hardware actions don't get one
     bot.request_approval(conv, "set_stirring_rpm", dict(rpm=300))
     assert not [b for b in buttons(bot.client.posts[1]) if b.get("url")]
+
+
+def test_replay_gif_animates_the_run(tmp_path):
+    from PIL import Image
+
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    tools = PioreactorTools(make_settings(tmp_path), render_terminal=False)
+    plan = running_plan(start)
+    plan.duration_h = 20 / 60  # finished just now
+    out = tools.replay_plan_gif(plan, frames=12)
+    with Image.open(out["gif_path"]) as gif:
+        assert gif.format == "GIF" and gif.n_frames == 12
+    assert 1.7 <= out["off_target_min"]["stirring"] <= 2.3  # counted over the whole run
+
+
+def test_final_message_shows_the_replay_and_no_adjust_button(tmp_path):
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    bot = bot_with(with_public_url(tmp_path))
+    plan = running_plan(start, slack_channel="C1", slack_thread_ts="1.1")
+    plan.duration_h = 20 / 60
+    bot.post_progress(plan, final=True)
+    card = bot.client.posts[0]
+    assert "finished" in card["text"]
+    assert str(bot.client.files[0]["file"]).endswith(".gif")
+    assert any(b["type"] == "image" for b in card["blocks"])
+    assert not [b for b in buttons(card) if b.get("url")]

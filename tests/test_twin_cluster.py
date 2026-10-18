@@ -185,3 +185,39 @@ def test_twin_job_result_uses_pioreactor_envelope(cluster):
     assert result["twin2"]["ok"] is True and result["twin2"]["unit"] == "twin2"
     result = api.stop_job("twin2", "od_reading", "demo")
     assert result["twin2"]["ok"] is True
+
+
+def test_slack_card_apply_changes_the_twin(cluster):
+    """The live Slack card against the twin: a stepper only proposes; Apply moves the (simulated) stirrer."""
+    tw, cfg, _ = cluster
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_live_card import LiveSlack, action_ids
+    from test_slack_plan import bot_with
+    from slack_bot import Conversation
+
+    bot = bot_with(cfg, LiveSlack())
+    bot.submit = lambda fn, *a: fn(*a)
+    for job in list(tw.reactors["twin1"].jobs):  # earlier tests leave jobs running; the profile would refuse to start them
+        tw.stop_job("twin1", job)
+    out = bot.tools.start_experiment(name="card", duration_h=0.5, temperature_c=30, rpm=300, unit="twin1")
+    assert out["ok"], out
+    bot.on_tool_result(Conversation(channel="C1", thread_ts="1.1", requester="U1"), "start_experiment", {}, out, False)
+    assert bot.tools.plans.get("twin1").slack_card_ts == "1"
+    wait_for(lambda: abs(tools_rpm(bot, "twin1") - 300) < 15, 20, "300 rpm")
+
+    assert bot.step("twin1", "U1", "larre_step_rpm_up") is None
+    time.sleep(2)
+    assert abs(tools_rpm(bot, "twin1") - 300) < 15  # proposing moved nothing
+    assert "larre_apply" in action_ids(bot.client.updates[-1])
+
+    assert bot.apply("twin1", "U2") is None
+    wait_for(lambda: abs(tools_rpm(bot, "twin1") - 350) < 15, 20, "350 rpm after Apply")
+    plan = bot.tools.plans.get("twin1")
+    assert plan.target("stirring") == 350 and plan.expected_state()["target_rpm"] == 350
+    card = bot.client.updates[-1]
+    assert card["ts"] == "1" and "larre_apply" not in action_ids(card)
+    assert bot.tools.stop_experiment(unit="twin1")["ok"]
+
+
+def tools_rpm(bot, unit):
+    return bot.tools._live_state().get(unit, {}).get("stirring", {}).get("value", 0)

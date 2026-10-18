@@ -59,6 +59,12 @@ AMBIENT_C = 22.0
 JOBS = {"stirring", "temperature_automation", "od_reading", "growth_rate_calculating"}
 PUMPS = {"add_media": 1.0, "remove_waste": -1.0, "add_alt_media": 1.0}
 PUMP_ML_PER_S = 0.5
+# Thermostat, from Pioreactor 26.11 on a 20 ml v1.0 (pio01's model) and pio01's readings on 17 Oct.
+# See docs/twin-fidelity.md. --temp-speed divides the times for stage demos.
+TEMP_INFERENCE_S = 225.0  # INFERENCE_EVERY_N_SECONDS: one temperature reading per cycle
+HEAT_TAU_S = 720.0  # pio01's first heat-up fits a first-order warm-up with a 12.3 min time constant
+COOL_TAU_S = 600.0  # not measured on pio01
+MAX_TARGET_TEMP_C = 63.0  # thermostat clamp: max_temp_to_reduce_heating on a 20 ml v1.0
 FAULTS = {"heater_fail", "stir_stall", "bubble", "contamination", "vial_removed"}
 
 
@@ -93,8 +99,9 @@ class VirtualReactor:
     volume_ml: float = 14.0
     carrying_capacity: float = 2.0
     mu_max_per_h: float = 1.2  # E. coli-like at the optimum
-    heat_tau_s: float = 90.0  # thermostat time constant towards the setpoint
-    cool_tau_s: float = 600.0  # passive cooling towards ambient
+    heat_tau_s: float = HEAT_TAU_S  # thermostat time constant towards the setpoint
+    cool_tau_s: float = COOL_TAU_S  # passive cooling towards ambient
+    next_temp_at: float | None = None  # when the next temperature is published; None = at the next tick
     jobs: dict[str, dict[str, Any]] = field(default_factory=dict)  # running job -> settings
     faults: set[str] = field(default_factory=set)
     _ln_od_history: list[tuple[float, float]] = field(default_factory=list)
@@ -193,10 +200,17 @@ class ProfileRun:
 class Twin:
     def __init__(self, units: list[str], experiment: str, mqtt_host: str, mqtt_port: int,
                  mqtt_auth: tuple[str, str] | None = None, bio_speed: float = 10.0,
-                 od_interval_s: float = 5.0, slow_interval_s: float = 10.0, profile_dir: Path | None = None):
+                 od_interval_s: float = 5.0, slow_interval_s: float | None = None, profile_dir: Path | None = None,
+                 temp_speed: float = 1.0):
         self.experiment = experiment
-        self.reactors = {u: VirtualReactor(u, experiment, bio_speed) for u in units}
-        self.od_interval_s, self.slow_interval_s = od_interval_s, slow_interval_s
+        self.reactors = {u: VirtualReactor(u, experiment, bio_speed, heat_tau_s=HEAT_TAU_S / temp_speed,
+                                           cool_tau_s=COOL_TAU_S / temp_speed) for u in units}
+        self.od_interval_s = od_interval_s
+        # slow_interval_s, if given, sets both the temperature and stirring cadence (the end-to-end test uses it).
+        self.temp_interval_s = slow_interval_s if slow_interval_s is not None else TEMP_INFERENCE_S / temp_speed
+        self.stir_interval_s = slow_interval_s if slow_interval_s is not None else 10.0
+        self._next_od = self._next_stir = 0.0
+        self._last_tick: float | None = None
         self.tasks: dict[str, dict[str, Any]] = {}
         self.profiles: dict[str, str] = {}
         self.runs: dict[int, ProfileRun] = {}
@@ -250,6 +264,9 @@ class Twin:
                 settings[attr] = float(value)
             except ValueError:
                 settings[attr] = value
+            if job == "temperature_automation" and attr == "target_temperature":
+                settings[attr] = clamp_target_temperature(settings[attr])
+                value = str(settings[attr])
         self.publish(self.topic(unit, job, attr), value, retain=True)
         log.info("%s: %s.%s = %s", unit, job, attr, value)
 
@@ -277,7 +294,8 @@ class Twin:
                 settings["target_rpm"] = float(opts.get("target_rpm", 500))
             if job == "temperature_automation":
                 settings["automation_name"] = opts.get("automation_name", "thermostat")
-                settings["target_temperature"] = float(opts.get("target_temperature", 30))
+                settings["target_temperature"] = clamp_target_temperature(float(opts.get("target_temperature", 30)))
+                reactor.next_temp_at = None  # like Pioreactor: a reading as the thermostat starts
             reactor.jobs[job] = settings
         self.publish(self.topic(unit, job, "$state"), "ready", retain=True)
         for k, v in settings.items():
@@ -406,38 +424,42 @@ class Twin:
     # ------------------------------------------------------------ simulation loop
 
     def run_loop(self, tick_s: float = 1.0) -> None:
-        next_od = next_slow = 0.0
-        last = time.monotonic()
         while not self.stop_event.is_set():
-            now = time.monotonic()
-            dt, last = now - last, now
-            for r in self.reactors.values():
-                r.step(dt)
-            if now >= next_od:
-                next_od = now + self.od_interval_s
-                for r in self.reactors.values():
-                    if "od_reading" in r.jobs:
-                        od = r.observed_od()
-                        ts = now_iso()
-                        self.publish(self.topic(r.unit, "od_reading", "od1"),
-                                     {"od": round(od, 6), "angle": "90", "channel": "1", "timestamp": ts})
-                        if "growth_rate_calculating" in r.jobs:
-                            gr = r.growth_rate_real_h(od)
-                            self.publish(self.topic(r.unit, "growth_rate_calculating", "growth_rate"),
-                                         {"growth_rate": round(gr, 5), "timestamp": ts})
-            if now >= next_slow:
-                next_slow = now + self.slow_interval_s
-                for r in self.reactors.values():
-                    ts = now_iso()
-                    if "temperature_automation" in r.jobs:
-                        t = r.temperature_c + random.gauss(0, 0.03)
-                        self.publish(self.topic(r.unit, "temperature_automation", "temperature"),
-                                     {"temperature": round(t, 3), "timestamp": ts})
-                    if "stirring" in r.jobs:
-                        self.publish(self.topic(r.unit, "stirring", "measured_rpm"),
-                                     {"measured_rpm": round(max(0.0, r.measured_rpm + random.gauss(0, 2)), 1),
-                                      "timestamp": ts})
+            self.tick(time.monotonic())
             self.stop_event.wait(tick_s)
+
+    def tick(self, now: float) -> None:
+        """Advance the physics to `now` (seconds, any monotonic clock) and publish whatever is due."""
+        dt = 0.0 if self._last_tick is None else now - self._last_tick
+        self._last_tick = now
+        for r in self.reactors.values():
+            r.step(dt)
+        if now >= self._next_od:
+            self._next_od = now + self.od_interval_s
+            for r in self.reactors.values():
+                if "od_reading" in r.jobs:
+                    od = r.observed_od()
+                    ts = now_iso()
+                    self.publish(self.topic(r.unit, "od_reading", "od1"),
+                                 {"od": round(od, 6), "angle": "90", "channel": "1", "timestamp": ts})
+                    if "growth_rate_calculating" in r.jobs:
+                        gr = r.growth_rate_real_h(od)
+                        self.publish(self.topic(r.unit, "growth_rate_calculating", "growth_rate"),
+                                     {"growth_rate": round(gr, 5), "timestamp": ts})
+        # Temperature: one reading as the thermostat starts, then one per inference cycle (per unit).
+        for r in self.reactors.values():
+            if "temperature_automation" in r.jobs and (r.next_temp_at is None or now >= r.next_temp_at - 1e-9):
+                r.next_temp_at = now + self.temp_interval_s
+                t = r.temperature_c + random.gauss(0, 0.03)
+                self.publish(self.topic(r.unit, "temperature_automation", "temperature"),
+                             {"temperature": round(t, 3), "timestamp": now_iso()})
+        if now >= self._next_stir:
+            self._next_stir = now + self.stir_interval_s
+            for r in self.reactors.values():
+                if "stirring" in r.jobs:
+                    self.publish(self.topic(r.unit, "stirring", "measured_rpm"),
+                                 {"measured_rpm": round(max(0.0, r.measured_rpm + random.gauss(0, 2)), 1),
+                                  "timestamp": now_iso()})
 
     def start(self) -> None:
         self.client.connect_async(self.mqtt_host, self.mqtt_port, 30)
@@ -575,6 +597,11 @@ def make_handler(twin: Twin):
     return Handler
 
 
+def clamp_target_temperature(value: Any) -> Any:
+    """Pioreactor's thermostat clamps its target to 0..max_temp_to_reduce_heating (63 °C on a 20 ml v1.0)."""
+    return min(max(float(value), 0.0), MAX_TARGET_TEMP_C) if isinstance(value, (int, float)) else value
+
+
 def per_unit(unit: str, value: Any) -> dict[str, Any]:
     """Pioreactor 26.11 reduces a job run/stop across units to {unit: {"ok", "unit", "value"}} (web/tasks.py)."""
     return {unit: {"ok": True, "unit": unit, "value": value}}
@@ -598,6 +625,9 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8790, help="HTTP port (the twin's 'leader URL')")
     p.add_argument("--bio-speed", type=float, default=10.0, help="growth speed-up; schedules stay real-time")
     p.add_argument("--od-interval", type=float, default=5.0)
+    p.add_argument("--temp-speed", type=float, default=1.0,
+                   help="thermostat speed-up: 1 = a real 20 ml Pioreactor (a reading every 225 s, about 25 min "
+                        "to reach 37 °C); 10 for a stage demo")
     p.add_argument("--profile-dir", type=Path, help="also save uploaded profiles here")
     a = p.parse_args()
 
@@ -605,11 +635,11 @@ def main() -> None:
     m = settings.mqtt
     twin = Twin([u.strip() for u in a.units.split(",") if u.strip()], a.experiment, a.mqtt_host, a.mqtt_port,
                 (m.username, m.password or "") if m.username else None, a.bio_speed, a.od_interval,
-                profile_dir=a.profile_dir)
+                profile_dir=a.profile_dir, temp_speed=a.temp_speed)
     twin.start()
     server = serve(twin, a.host, a.port)
-    log.info("twin up: units=%s experiment=%s http://%s:%d mqtt=%s:%d bio_speed=%g",
-             list(twin.reactors), a.experiment, a.host, a.port, a.mqtt_host, a.mqtt_port, a.bio_speed)
+    log.info("twin up: units=%s experiment=%s http://%s:%d mqtt=%s:%d bio_speed=%g temp_speed=%g",
+             list(twin.reactors), a.experiment, a.host, a.port, a.mqtt_host, a.mqtt_port, a.bio_speed, a.temp_speed)
     try:
         while True:
             time.sleep(3600)
