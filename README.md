@@ -6,6 +6,8 @@ Existing bioreactors are clunky, require faffing about with a screen, and are ne
 
 And you have to continually babysit them.
 
+Not anymore! Just chat to experiments via Slack!
+
 
 
 
